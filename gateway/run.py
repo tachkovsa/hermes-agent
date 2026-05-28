@@ -744,7 +744,11 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    set_hermes_home_override,
+    reset_hermes_home_override,
+)
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -16468,25 +16472,31 @@ class GatewayRunner:
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
             
             # ── Per-chat profile routing ─────────────────────────────────────────
-            # Resolve the correct HERMES_HOME based on chat_id before loading any
-            # profile-specific resources (config.yaml, .env, SOUL.md, memory, etc.)
-            # This enables multiple Telegram users to share one gateway process
-            # while maintaining complete profile isolation.
+            # Resolve the correct HERMES_HOME based on the originating chat before
+            # loading any profile-specific resources (config.yaml, .env, SOUL.md,
+            # memory, etc.). Lets several chats/channels share one gateway process
+            # while keeping per-profile isolation — e.g. routing a shared Mattermost
+            # channel to a "team" profile so it never touches personal memory.
+            #
+            # Config shape (gateway config.yaml):
+            #   profile_routing:
+            #     <platform>:                 # telegram | mattermost | slack | …
+            #       "<chat_or_channel_id>": <profile_name>
             _profile_routing_token = None
             routing_config = _load_gateway_config()
-            if source.platform == Platform.TELEGRAM and source.chat_id:
+            if source.chat_id:
                 try:
                     from hermes_cli.profiles import get_profile_dir
                     routing_cfg = routing_config.get("profile_routing") or {}
-                    plat_cfg = routing_cfg.get("telegram") or {}
+                    plat_cfg = routing_cfg.get(platform_key) or {}
                     profile_name = plat_cfg.get(str(source.chat_id))
                     if profile_name:
                         profile_home = get_profile_dir(profile_name)
                         if profile_home and profile_home.exists():
                             _profile_routing_token = set_hermes_home_override(str(profile_home))
                             logger.debug(
-                                "profile_routing: chat_id=%s → profile=%s (hermes_home=%s)",
-                                source.chat_id, profile_name, profile_home,
+                                "profile_routing: platform=%s chat_id=%s → profile=%s (hermes_home=%s)",
+                                platform_key, source.chat_id, profile_name, profile_home,
                             )
                 except Exception as _pr_err:
                     logger.debug("profile_routing lookup failed: %s", _pr_err)
