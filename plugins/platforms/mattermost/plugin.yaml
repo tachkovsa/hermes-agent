@@ -47,13 +47,17 @@ optional_env:
     description: "If set, the bot only responds in these channels (whitelist)."
     prompt: "Allowed channel IDs (comma-separated)"
     password: false
+  - name: MATTERMOST_SLASH_COMMANDS
+    description: "Enable native slash-command registration (true/false). In auto mode (no URL) the adapter binds to the host's docker-bridge gateway and detects which bridge Mattermost is on."
+    prompt: "Enable slash commands? (true/false)"
+    password: false
   - name: MATTERMOST_SLASH_COMMAND_URL
-    description: "Public URL Mattermost POSTs custom slash commands to (e.g. https://chat.example.com/hermes/command). Enables native /commands on mobile/desktop. Must be reachable from the Mattermost server."
+    description: "Manual override: explicit callback URL Mattermost POSTs to (e.g. https://chat.example.com/hermes/command). Leave empty to auto-detect a private docker-bridge address."
     prompt: "Slash command callback URL"
     password: false
-  - name: MATTERMOST_SLASH_COMMANDS
-    description: "Enable/disable native slash-command registration (default true when a callback URL is set)."
-    prompt: "Enable slash commands? (true/false)"
+  - name: MATTERMOST_SLASH_AUTO_CONFIG
+    description: "In auto mode, let Hermes add the detected private IP to Mattermost's AllowedUntrustedInternalConnections via the admin API (true/false). Requires an admin token."
+    prompt: "Auto-configure MM SSRF allowlist? (true/false)"
     password: false
   - name: MATTERMOST_SLASH_BIND_HOST
     description: "Host the local slash-command callback server binds to (default 127.0.0.1)."

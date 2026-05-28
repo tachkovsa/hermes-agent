@@ -102,10 +102,19 @@ class MattermostAdapter(BasePlatformAdapter):
         # ── Native slash commands (issue #6296 / #25184) ──────────────────
         # Mattermost clients intercept "/" — unless a command is registered
         # server-side it can't be sent from mobile and needs an extra confirm
-        # on desktop. When a reachable callback URL is configured we register
-        # every gateway command (COMMAND_REGISTRY) as a Mattermost custom slash
-        # command and run a small loopback HTTP server to receive the command
-        # callbacks, routing them into the normal gateway dispatch.
+        # on desktop. When enabled, we register every gateway command
+        # (COMMAND_REGISTRY) as a Mattermost custom slash command and run a
+        # small HTTP server to receive the command callbacks, routing them
+        # into the normal gateway dispatch.
+        #
+        # Two modes:
+        #   * Manual — set MATTERMOST_SLASH_COMMAND_URL to a reachable callback
+        #     URL (and optionally MATTERMOST_SLASH_BIND_HOST).
+        #   * Auto (MATTERMOST_SLASH_COMMANDS=true, no URL) — bind to the host's
+        #     docker-bridge gateway and auto-detect which bridge Mattermost is
+        #     on, so the callback never leaves the private docker network. With
+        #     MATTERMOST_SLASH_AUTO_CONFIG=true the adapter also adds that
+        #     private IP to Mattermost's AllowedUntrustedInternalConnections.
         def _extra(key: str, env: str, default: str = "") -> str:
             val = config.extra.get(key) if config.extra else None
             if val is None or val == "":
@@ -115,12 +124,16 @@ class MattermostAdapter(BasePlatformAdapter):
         self._slash_command_url: str = str(
             _extra("slash_command_url", "MATTERMOST_SLASH_COMMAND_URL", "")
         ).strip()
-        self._slash_enabled: bool = (
+        self._slash_enabled: bool = bool(self._slash_command_url) or (
             str(_extra("slash_commands", "MATTERMOST_SLASH_COMMANDS", "")).lower()
-            not in {"false", "0", "no"}
-        ) and bool(self._slash_command_url)
+            in {"true", "1", "yes", "on"}
+        )
+        self._slash_auto_config: bool = (
+            str(_extra("slash_auto_config", "MATTERMOST_SLASH_AUTO_CONFIG", "")).lower()
+            in {"true", "1", "yes", "on"}
+        )
         self._slash_bind_host: str = str(
-            _extra("slash_bind_host", "MATTERMOST_SLASH_BIND_HOST", "127.0.0.1")
+            _extra("slash_bind_host", "MATTERMOST_SLASH_BIND_HOST", "")
         ).strip()
         self._slash_bind_port: int = int(
             _extra("slash_bind_port", "MATTERMOST_SLASH_BIND_PORT", "8646") or 8646
@@ -132,6 +145,7 @@ class MattermostAdapter(BasePlatformAdapter):
             self._slash_team_ids = [t.strip() for t in str(_team_ids_raw).split(",") if t.strip()]
         self._slash_tokens: set = set()
         self._slash_runner: Any = None  # aiohttp.web.AppRunner
+        self._slash_callback_path: str = "/hermes/command"
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -259,15 +273,10 @@ class MattermostAdapter(BasePlatformAdapter):
         self._ws_task = asyncio.create_task(self._ws_loop())
 
         # Native slash commands (best-effort; never blocks gateway startup).
+        # Detection + registration (~one API call per command) runs in the
+        # background so connect() returns promptly.
         if self._slash_enabled:
-            try:
-                await self._start_slash_server()
-            except Exception as exc:
-                logger.error("Mattermost: slash callback server failed to start: %s", exc)
-            else:
-                # Registration (~one API call per command) runs in the
-                # background so connect() returns promptly.
-                asyncio.create_task(self._register_slash_commands())
+            asyncio.create_task(self._setup_slash_commands())
 
         self._mark_connected()
         return True
@@ -322,24 +331,160 @@ class MattermostAdapter(BasePlatformAdapter):
             return [t["id"] for t in mine if t.get("id")]
         return []
 
-    async def _start_slash_server(self) -> None:
-        """Run a small loopback HTTP server for Mattermost command callbacks."""
+    async def _setup_slash_commands(self) -> None:
+        """Resolve the callback endpoint, start the server, register commands."""
+        try:
+            if self._slash_command_url:
+                # Manual mode: operator supplied a reachable URL.
+                bind_hosts = [self._slash_bind_host or "127.0.0.1"]
+            else:
+                # Auto mode: bind to the host's docker-bridge gateway that
+                # Mattermost can reach, so the callback stays on the private
+                # docker network (never the public interface).
+                gateways = self._list_docker_bridge_gateways()
+                reg_host = None
+                for gw in gateways:
+                    if await self._mattermost_reachable_on(gw):
+                        reg_host = gw
+                        break
+                if reg_host is None and len(gateways) == 1:
+                    reg_host = gateways[0]
+                if reg_host is None:
+                    logger.error(
+                        "Mattermost: could not auto-detect a docker-bridge gateway "
+                        "Mattermost can reach (candidates=%s). Set "
+                        "MATTERMOST_SLASH_COMMAND_URL manually.", gateways,
+                    )
+                    return
+                self._slash_command_url = (
+                    f"http://{reg_host}:{self._slash_bind_port}{self._slash_callback_path}"
+                )
+                bind_hosts = ["127.0.0.1", reg_host]
+                if self._slash_auto_config:
+                    await self._ensure_mm_allowlist([reg_host])
+                else:
+                    logger.info(
+                        "Mattermost: auto-config off — ensure %s is in "
+                        "AllowedUntrustedInternalConnections or slash callbacks will be blocked.",
+                        reg_host,
+                    )
+
+            await self._start_slash_server(bind_hosts)
+            await self._register_slash_commands()
+        except Exception as exc:
+            logger.error("Mattermost: slash-command setup failed: %s", exc)
+
+    def _list_docker_bridge_gateways(self) -> List[str]:
+        """Private IPv4 addresses Hermes holds on docker bridge interfaces.
+
+        These are the host-side gateway IPs (e.g. 172.19.0.1) that containers
+        on those bridges use to reach the host. Pure-stdlib, no docker access.
+        """
+        import socket as _socket
+        import struct as _struct
+        import fcntl as _fcntl
+        import ipaddress as _ipaddress
+
+        out: List[str] = []
+        try:
+            ifaces = _socket.if_nameindex()
+        except OSError:
+            return out
+        for _idx, name in ifaces:
+            if not (name.startswith("br-") or name.startswith("docker")):
+                continue
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            try:
+                packed = _struct.pack("256s", name[:15].encode())
+                ip = _socket.inet_ntoa(_fcntl.ioctl(s.fileno(), 0x8915, packed)[20:24])  # SIOCGIFADDR
+            except OSError:
+                continue
+            finally:
+                s.close()
+            try:
+                if _ipaddress.ip_address(ip).is_private:
+                    out.append(ip)
+            except ValueError:
+                continue
+        return out
+
+    async def _mattermost_reachable_on(self, gateway_ip: str) -> bool:
+        """True if a Mattermost server answers on the bridge of ``gateway_ip``.
+
+        Probes the low container addresses of the gateway's /24 for an
+        unauthenticated ``/api/v4/system/ping`` — identifies which bridge the
+        Mattermost container sits on without any docker access.
+        """
+        import aiohttp
+        base = gateway_ip.rsplit(".", 1)[0]
+        for last in range(2, 9):
+            url = f"http://{base}.{last}:8065/api/v4/system/ping"
+            try:
+                async with self._session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
+                    if resp.status == 200 and "status" in (await resp.text()):
+                        logger.info(
+                            "Mattermost: detected MM on docker bridge %s (container %s.%s)",
+                            gateway_ip, base, last,
+                        )
+                        return True
+            except Exception:
+                continue
+        return False
+
+    async def _ensure_mm_allowlist(self, hosts: List[str]) -> None:
+        """Add ``hosts`` to Mattermost's AllowedUntrustedInternalConnections.
+
+        Mattermost (SSRF protection) refuses to POST slash-command callbacks to
+        private addresses unless they're allowlisted. Requires an admin token.
+        """
+        cfg = await self._api_get("config")
+        if not cfg:
+            logger.warning("Mattermost: cannot read config to update SSRF allowlist (admin token required)")
+            return
+        cur = (cfg.get("ServiceSettings", {}) or {}).get("AllowedUntrustedInternalConnections", "") or ""
+        entries = [h for h in cur.split() if h]
+        changed = False
+        for h in hosts:
+            if h not in entries:
+                entries.append(h)
+                changed = True
+        if not changed:
+            return
+        patch = {"ServiceSettings": {"AllowedUntrustedInternalConnections": " ".join(entries)}}
+        res = await self._api_put("config/patch", patch)
+        if res:
+            logger.info("Mattermost: added %s to AllowedUntrustedInternalConnections", hosts)
+        else:
+            logger.warning("Mattermost: failed to update AllowedUntrustedInternalConnections for %s", hosts)
+
+    async def _start_slash_server(self, bind_hosts: List[str]) -> None:
+        """Run the HTTP server that receives Mattermost command callbacks."""
         from aiohttp import web
 
         app = web.Application()
         app.router.add_get("/healthz", lambda _r: web.json_response({"status": "ok"}))
-        # Accept POST on any path so the operator can freely choose the public
-        # path (and whether a reverse proxy strips a prefix) without breaking
-        # routing — the command is identified by the form body, not the path.
+        # Accept POST on any path so the command is identified by the form body,
+        # not the path (robust to reverse-proxy prefix handling).
         app.router.add_post("/{tail:.*}", self._handle_slash_callback)
 
         self._slash_runner = web.AppRunner(app)
         await self._slash_runner.setup()
-        site = web.TCPSite(self._slash_runner, self._slash_bind_host, self._slash_bind_port)
-        await site.start()
+        bound: List[str] = []
+        for host in bind_hosts:
+            try:
+                site = web.TCPSite(self._slash_runner, host, self._slash_bind_port)
+                await site.start()
+                bound.append(host)
+            except Exception as exc:
+                logger.warning(
+                    "Mattermost: could not bind slash server to %s:%s: %s",
+                    host, self._slash_bind_port, exc,
+                )
         logger.info(
-            "Mattermost: slash callback server on http://%s:%s (registered URL: %s)",
-            self._slash_bind_host, self._slash_bind_port, self._slash_command_url,
+            "Mattermost: slash callback server bound to %s:%s (registered URL: %s)",
+            bound, self._slash_bind_port, self._slash_command_url,
         )
 
     async def _register_slash_commands(self) -> None:
