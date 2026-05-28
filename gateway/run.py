@@ -16467,6 +16467,35 @@ class GatewayRunner:
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
             
+            # ── Per-chat profile routing ─────────────────────────────────────────
+            # Resolve the correct HERMES_HOME based on chat_id before loading any
+            # profile-specific resources (config.yaml, .env, SOUL.md, memory, etc.)
+            # This enables multiple Telegram users to share one gateway process
+            # while maintaining complete profile isolation.
+            _profile_routing_token = None
+            routing_config = _load_gateway_config()
+            if source.platform == Platform.TELEGRAM and source.chat_id:
+                try:
+                    from hermes_cli.profiles import get_profile_dir
+                    routing_cfg = routing_config.get("profile_routing") or {}
+                    plat_cfg = routing_cfg.get("telegram") or {}
+                    profile_name = plat_cfg.get(str(source.chat_id))
+                    if profile_name:
+                        profile_home = get_profile_dir(profile_name)
+                        if profile_home and profile_home.exists():
+                            _profile_routing_token = set_hermes_home_override(str(profile_home))
+                            logger.debug(
+                                "profile_routing: chat_id=%s → profile=%s (hermes_home=%s)",
+                                source.chat_id, profile_name, profile_home,
+                            )
+                except Exception as _pr_err:
+                    logger.debug("profile_routing lookup failed: %s", _pr_err)
+
+            # Load the effective config after any HERMES_HOME override so the
+            # provider/runtime resolution below sees the correct profile-local
+            # settings.
+            user_config = _load_gateway_config()
+            
             # Combine platform context, per-channel context, and the user-configured
             # ephemeral system prompt.
             combined_ephemeral = context_prompt or ""
@@ -17094,6 +17123,14 @@ class GatewayRunner:
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+            # ── Reset per-chat profile routing ───────────────────────────────────
+            if _profile_routing_token is not None:
+                try:
+                    reset_hermes_home_override(_profile_routing_token)
+                except Exception:
+                    pass
+                _profile_routing_token = None
+            
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
