@@ -99,6 +99,40 @@ class MattermostAdapter(BasePlatformAdapter):
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
 
+        # ── Native slash commands (issue #6296 / #25184) ──────────────────
+        # Mattermost clients intercept "/" — unless a command is registered
+        # server-side it can't be sent from mobile and needs an extra confirm
+        # on desktop. When a reachable callback URL is configured we register
+        # every gateway command (COMMAND_REGISTRY) as a Mattermost custom slash
+        # command and run a small loopback HTTP server to receive the command
+        # callbacks, routing them into the normal gateway dispatch.
+        def _extra(key: str, env: str, default: str = "") -> str:
+            val = config.extra.get(key) if config.extra else None
+            if val is None or val == "":
+                val = os.getenv(env, default)
+            return val
+
+        self._slash_command_url: str = str(
+            _extra("slash_command_url", "MATTERMOST_SLASH_COMMAND_URL", "")
+        ).strip()
+        self._slash_enabled: bool = (
+            str(_extra("slash_commands", "MATTERMOST_SLASH_COMMANDS", "")).lower()
+            not in {"false", "0", "no"}
+        ) and bool(self._slash_command_url)
+        self._slash_bind_host: str = str(
+            _extra("slash_bind_host", "MATTERMOST_SLASH_BIND_HOST", "127.0.0.1")
+        ).strip()
+        self._slash_bind_port: int = int(
+            _extra("slash_bind_port", "MATTERMOST_SLASH_BIND_PORT", "8646") or 8646
+        )
+        _team_ids_raw = _extra("slash_team_ids", "MATTERMOST_SLASH_TEAM_IDS", "")
+        if isinstance(_team_ids_raw, list):
+            self._slash_team_ids = [str(t).strip() for t in _team_ids_raw if str(t).strip()]
+        else:
+            self._slash_team_ids = [t.strip() for t in str(_team_ids_raw).split(",") if t.strip()]
+        self._slash_tokens: set = set()
+        self._slash_runner: Any = None  # aiohttp.web.AppRunner
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
@@ -223,6 +257,18 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Start WebSocket in background.
         self._ws_task = asyncio.create_task(self._ws_loop())
+
+        # Native slash commands (best-effort; never blocks gateway startup).
+        if self._slash_enabled:
+            try:
+                await self._start_slash_server()
+            except Exception as exc:
+                logger.error("Mattermost: slash callback server failed to start: %s", exc)
+            else:
+                # Registration (~one API call per command) runs in the
+                # background so connect() returns promptly.
+                asyncio.create_task(self._register_slash_commands())
+
         self._mark_connected()
         return True
 
@@ -244,10 +290,222 @@ class MattermostAdapter(BasePlatformAdapter):
             await self._ws.close()
             self._ws = None
 
+        if self._slash_runner is not None:
+            try:
+                await self._slash_runner.cleanup()
+            except Exception:
+                pass
+            self._slash_runner = None
+
         if self._session and not self._session.closed:
             await self._session.close()
 
         logger.info("Mattermost: disconnected")
+
+    # ------------------------------------------------------------------
+    # Native slash commands (issue #6296 / #25184)
+    # ------------------------------------------------------------------
+
+    async def _resolve_command_team_ids(self) -> List[str]:
+        """Teams to register slash commands on.
+
+        Explicit config wins; otherwise discover all teams (works when the
+        token is a system admin) and fall back to the bot's own teams.
+        """
+        if self._slash_team_ids:
+            return self._slash_team_ids
+        teams = await self._api_get("teams?per_page=200")
+        if isinstance(teams, list) and teams:
+            return [t["id"] for t in teams if t.get("id")]
+        mine = await self._api_get("users/me/teams")
+        if isinstance(mine, list):
+            return [t["id"] for t in mine if t.get("id")]
+        return []
+
+    async def _start_slash_server(self) -> None:
+        """Run a small loopback HTTP server for Mattermost command callbacks."""
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_get("/healthz", lambda _r: web.json_response({"status": "ok"}))
+        # Accept POST on any path so the operator can freely choose the public
+        # path (and whether a reverse proxy strips a prefix) without breaking
+        # routing — the command is identified by the form body, not the path.
+        app.router.add_post("/{tail:.*}", self._handle_slash_callback)
+
+        self._slash_runner = web.AppRunner(app)
+        await self._slash_runner.setup()
+        site = web.TCPSite(self._slash_runner, self._slash_bind_host, self._slash_bind_port)
+        await site.start()
+        logger.info(
+            "Mattermost: slash callback server on http://%s:%s (registered URL: %s)",
+            self._slash_bind_host, self._slash_bind_port, self._slash_command_url,
+        )
+
+    async def _register_slash_commands(self) -> None:
+        """Register every gateway command as a Mattermost custom slash command.
+
+        Idempotent: existing commands (matched by trigger) are updated in place,
+        missing ones created. Per-command tokens are collected for callback
+        validation.
+        """
+        from hermes_cli.commands import mattermost_native_slashes
+
+        team_ids = await self._resolve_command_team_ids()
+        if not team_ids:
+            logger.warning("Mattermost: no teams found to register slash commands on")
+            return
+
+        desired = mattermost_native_slashes()
+        for team_id in team_ids:
+            existing = await self._api_get(f"commands?team_id={team_id}&custom_only=true")
+            by_trigger: Dict[str, Any] = {}
+            if isinstance(existing, list):
+                for c in existing:
+                    if c.get("trigger"):
+                        by_trigger[c["trigger"]] = c
+                        if c.get("token"):
+                            self._slash_tokens.add(c["token"])
+
+            # Triggers already owned by built-in/system or plugin commands on
+            # this instance — Mattermost rejects custom triggers that collide,
+            # so skip them (they stay reachable via /hermes <command>).
+            taken: set = set()
+            autocomplete = await self._api_get(
+                f"teams/{team_id}/commands/autocomplete?user_input=%2F"
+            )
+            if isinstance(autocomplete, list):
+                for c in autocomplete:
+                    trig = (c.get("trigger") or c.get("Trigger") or "").lstrip("/").lower()
+                    if trig:
+                        taken.add(trig)
+
+            created = updated = skipped = 0
+            for trigger, desc, hint in desired:
+                cur = by_trigger.get(trigger)
+                if cur is None and trigger in taken:
+                    skipped += 1
+                    continue
+                payload = {
+                    "team_id": team_id,
+                    "trigger": trigger,
+                    "method": "P",
+                    "url": self._slash_command_url,
+                    "auto_complete": True,
+                    "auto_complete_desc": desc or f"Run /{trigger}",
+                    "auto_complete_hint": hint,
+                    "display_name": f"/{trigger}",
+                }
+                if cur is None:
+                    res = await self._api_post("commands", payload)
+                    if res.get("token"):
+                        self._slash_tokens.add(res["token"])
+                        created += 1
+                else:
+                    needs_update = (
+                        cur.get("url") != self._slash_command_url
+                        or cur.get("method") != "P"
+                        or not cur.get("auto_complete")
+                        or cur.get("auto_complete_desc") != payload["auto_complete_desc"]
+                        or cur.get("auto_complete_hint") != hint
+                    )
+                    if needs_update:
+                        merged = dict(cur)
+                        merged.update(payload)
+                        merged["id"] = cur["id"]
+                        res = await self._api_put(f"commands/{cur['id']}", merged)
+                        updated += 1
+                    if cur.get("token"):
+                        self._slash_tokens.add(cur["token"])
+            logger.info(
+                "Mattermost: slash commands on team %s — %d created, %d updated, "
+                "%d skipped (built-in/plugin), %d total desired",
+                team_id, created, updated, skipped, len(desired),
+            )
+
+    def _compose_slash_text(self, command: str, text: str) -> Optional[str]:
+        """Turn a Mattermost (command, text) pair into gateway input text."""
+        trigger = command.lstrip("/").strip().lower()
+        if trigger in {"hermes", ""}:
+            # Legacy /hermes <subcommand|question> catch-all (mirrors Slack).
+            from hermes_cli.commands import slack_subcommand_map
+            sub = slack_subcommand_map()
+            sub["compact"] = "/compress"
+            parts = text.split() if text else []
+            first = parts[0] if parts else ""
+            if first in sub:
+                rest = text[len(first):].strip()
+                return f"{sub[first]} {rest}".strip() if rest else sub[first]
+            if text:
+                return text  # free-form question
+            return "/help"
+        return f"/{trigger} {text}".strip()
+
+    async def _handle_slash_callback(self, request) -> Any:
+        """Receive a Mattermost custom slash command POST and dispatch it."""
+        from aiohttp import web
+        try:
+            data = await request.post()  # MM sends application/x-www-form-urlencoded
+        except Exception:
+            return web.json_response({"text": "bad request"}, status=400)
+
+        token = data.get("token", "")
+        if self._slash_tokens and token not in self._slash_tokens:
+            logger.warning("Mattermost: rejecting slash callback with unknown token")
+            return web.json_response({}, status=403)
+
+        command = (data.get("command") or "").strip()
+        text = (data.get("text") or "").strip()
+        channel_id = data.get("channel_id", "")
+        channel_name = data.get("channel_name", "")
+        user_id = data.get("user_id", "")
+        user_name = (data.get("user_name", "") or "").lstrip("@")
+
+        full_text = self._compose_slash_text(command, text)
+        if not channel_id or not full_text:
+            return web.json_response({}, status=200)
+
+        # Dispatch asynchronously so we ACK within Mattermost's response window;
+        # the agent's reply is delivered through the normal send path.
+        asyncio.create_task(
+            self._dispatch_slash(full_text, channel_id, channel_name, user_id, user_name, dict(data))
+        )
+        return web.json_response({}, status=200)
+
+    async def _dispatch_slash(
+        self,
+        full_text: str,
+        channel_id: str,
+        channel_name: str,
+        user_id: str,
+        user_name: str,
+        raw: Dict[str, Any],
+    ) -> None:
+        """Build a MessageEvent for a slash command and route it into dispatch."""
+        try:
+            # Resolve channel type (DM vs group/channel) for correct session keying.
+            if "__" in (channel_name or ""):
+                chat_type = "dm"
+            else:
+                info = await self._api_get(f"channels/{channel_id}")
+                chat_type = _CHANNEL_TYPE_MAP.get(info.get("type", "O"), "channel") if info else "channel"
+
+            source = self.build_source(
+                chat_id=channel_id,
+                chat_type=chat_type,
+                user_id=user_id,
+                user_name=user_name or user_id,
+            )
+            msg_type = MessageType.COMMAND if full_text.startswith("/") else MessageType.TEXT
+            event = MessageEvent(
+                text=full_text,
+                message_type=msg_type,
+                source=source,
+                raw_message=raw,
+            )
+            await self.handle_message(event)
+        except Exception as exc:
+            logger.error("Mattermost: slash dispatch failed: %s", exc)
 
 
     async def _resolve_root_id(self, post_id: str) -> str:

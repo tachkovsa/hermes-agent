@@ -47,3 +47,23 @@ optional_env:
     description: "If set, the bot only responds in these channels (whitelist)."
     prompt: "Allowed channel IDs (comma-separated)"
     password: false
+  - name: MATTERMOST_SLASH_COMMAND_URL
+    description: "Public URL Mattermost POSTs custom slash commands to (e.g. https://chat.example.com/hermes/command). Enables native /commands on mobile/desktop. Must be reachable from the Mattermost server."
+    prompt: "Slash command callback URL"
+    password: false
+  - name: MATTERMOST_SLASH_COMMANDS
+    description: "Enable/disable native slash-command registration (default true when a callback URL is set)."
+    prompt: "Enable slash commands? (true/false)"
+    password: false
+  - name: MATTERMOST_SLASH_BIND_HOST
+    description: "Host the local slash-command callback server binds to (default 127.0.0.1)."
+    prompt: "Slash callback bind host"
+    password: false
+  - name: MATTERMOST_SLASH_BIND_PORT
+    description: "Port the local slash-command callback server binds to (default 8646)."
+    prompt: "Slash callback bind port"
+    password: false
+  - name: MATTERMOST_SLASH_TEAM_IDS
+    description: "Comma-separated team IDs to register commands on (default: all teams the token can see)."
+    prompt: "Slash command team IDs (comma-separated)"
+    password: false

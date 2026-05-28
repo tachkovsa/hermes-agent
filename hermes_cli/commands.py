@@ -1117,6 +1117,90 @@ def slack_app_manifest(request_url: str = "https://hermes-agent.local/slack/comm
     return {"features": {"slash_commands": slashes}}
 
 
+# ---------------------------------------------------------------------------
+# Mattermost native slash commands
+# ---------------------------------------------------------------------------
+
+# Mattermost custom slash command trigger constraints: a single token,
+# lowercased, no spaces. Mattermost rejects (HTTP 400) any custom trigger that
+# collides with one of its built-in client/system commands, so those are
+# skipped here — they stay reachable via ``/hermes <command>``.
+_MATTERMOST_NAME_LIMIT = 32
+_MATTERMOST_INVALID_CHARS = re.compile(r"[^a-z0-9_\-]")
+_MATTERMOST_RESERVED_COMMANDS = frozenset({
+    # Built-in Mattermost slash commands.
+    # https://docs.mattermost.com/collaborate/run-slash-commands.html
+    "away", "code", "collapse", "dnd", "dm", "echo", "expand", "groupmsg",
+    "header", "help", "invite", "invite_people", "join", "kick", "leave",
+    "logout", "marketplace", "me", "msg", "mute", "offline", "online",
+    "open", "purpose", "remove", "rename", "search", "settings",
+    "shortcuts", "shrug", "status", "switch",
+})
+
+
+def _sanitize_mattermost_name(raw: str) -> str:
+    """Convert a command name to a valid Mattermost custom-command trigger.
+
+    Mattermost triggers are lowercased single tokens; invalid characters are
+    stripped (mirrors ``_sanitize_slack_name``).
+    """
+    name = raw.lower()
+    name = _MATTERMOST_INVALID_CHARS.sub("", name)
+    name = name.strip("-_")
+    return name[:_MATTERMOST_NAME_LIMIT]
+
+
+def mattermost_native_slashes() -> list[tuple[str, str, str]]:
+    """Return (trigger, description, autocomplete_hint) triples for Mattermost.
+
+    Mirror of :func:`slack_native_slashes` for Mattermost custom slash
+    commands. Every gateway-available command in ``COMMAND_REGISTRY`` (plus
+    aliases and plugin-registered commands) is surfaced as a native
+    ``/trigger`` so Mattermost desktop/mobile clients stop intercepting them.
+
+    Triggers that collide with a Mattermost built-in (e.g. ``/help``,
+    ``/status``, ``/away``) are skipped — Mattermost rejects them on
+    registration anyway, and they remain reachable via ``/hermes <command>``.
+    ``/hermes`` is reserved as the catch-all entry.
+    """
+    overrides = _resolve_config_gates()
+    entries: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    # Reserve /hermes as the catch-all top-level command (free-form questions
+    # and any command dropped by the reserved-name filter).
+    entries.append(("hermes", "Talk to Hermes or run a subcommand", "[subcommand] [args]"))
+    seen.add("hermes")
+
+    def _add(name: str, desc: str, hint: str) -> None:
+        trig = _sanitize_mattermost_name(name)
+        if not trig or trig in seen:
+            return
+        if trig in _MATTERMOST_RESERVED_COMMANDS:
+            return
+        entries.append((trig, desc[:128], hint[:64]))
+        seen.add(trig)
+
+    # First pass: canonical names.
+    for cmd in COMMAND_REGISTRY:
+        if not _is_gateway_available(cmd, overrides):
+            continue
+        _add(cmd.name, cmd.description, cmd.args_hint or "")
+
+    # Second pass: aliases.
+    for cmd in COMMAND_REGISTRY:
+        if not _is_gateway_available(cmd, overrides):
+            continue
+        for alias in cmd.aliases:
+            _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+
+    # Third pass: plugin commands.
+    for name, description, args_hint in _iter_plugin_command_entries():
+        _add(name, description, args_hint or "")
+
+    return entries
+
+
 def slack_subcommand_map() -> dict[str, str]:
     """Return subcommand -> /command mapping for Slack /hermes handler.
 
